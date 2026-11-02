@@ -3,6 +3,7 @@ import {
   CANNON,
   ENTRY_SECONDS,
   LEADERBOARD_SECONDS,
+  MAX_STEP_SECONDS,
   OVER_SECONDS,
   TANK_SIZE,
   TITLE_SECONDS,
@@ -14,7 +15,9 @@ import {
   isHit,
   scoreForHit,
   step,
+  stop,
   submitName,
+  tick,
   type ScoreSink,
   type Target,
   type WaterCannonState,
@@ -257,5 +260,62 @@ describe('water cannon screens', () => {
     expect(filterName("O'Neil-Jr.")).toBe("O'Neil-Jr.");
     expect(filterName('Zoë 😀 K')).toBe('Zo  K');
     expect(filterName('ABCDEFGHIJKLMNOP')).toBe('ABCDEFGHIJKL');
+  });
+
+  it('filters a pasted name before cutting it to 12 characters', () => {
+    expect(filterName('!!!ABCDEFGHIJKL')).toBe('ABCDEFGHIJKL');
+  });
+
+  it('moves the countdown by a full second on a 1-second tick, but caps the physics', () => {
+    const scores = fakeScores(true);
+    const state = finishedRound(80);
+    step(state, 0, scores);
+    state.targets = [{ ...target }];
+    tick(state, 1, scores);
+    expect(entryCountdown(state)).toBe(ENTRY_SECONDS - 1);
+    expect(state.targets[0].x).toBeCloseTo(target.x + target.speed * MAX_STEP_SECONDS);
+  });
+
+  it('times the title and game over screens in real seconds on slow frames', () => {
+    const scores = fakeScores(false);
+    const title = createState('title');
+    for (let i = 0; i < TITLE_SECONDS; i++) tick(title, 1, scores);
+    expect(title.phase).toBe('leaderboard');
+    const over = finishedRound(40);
+    tick(over, 0.01, scores);
+    for (let i = 0; i < OVER_SECONDS; i++) tick(over, 1, scores);
+    expect(over.phase).toBe('title');
+  });
+
+  it('saves the pending score once when the game stops during name entry', () => {
+    for (const [typed, saved] of [
+      ['Ada', { score: 80, name: 'Ada' }],
+      ['  ', { score: 80 }],
+    ] as const) {
+      const scores = fakeScores(true);
+      const state = finishedRound(80);
+      step(state, 0.01, scores);
+      state.name = typed;
+      stop(state, scores);
+      stop(state, scores);
+      expect(scores.records).toEqual([saved]);
+    }
+  });
+
+  it('saves nothing extra when the game stops in any other phase', () => {
+    for (const phase of ['title', 'leaderboard', 'playing', 'over'] as const) {
+      const scores = fakeScores(true);
+      const state = createState(phase);
+      state.score = 80;
+      stop(state, scores);
+      expect(scores.records).toEqual([]);
+    }
+    const scores = fakeScores(true);
+    const state = finishedRound(80);
+    step(state, 0.01, scores);
+    state.name = 'Ada';
+    submitName(state, scores);
+    stop(state, scores);
+    expect(scores.records).toHaveLength(1);
   });
 });

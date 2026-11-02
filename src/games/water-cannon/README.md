@@ -16,8 +16,9 @@ Soak the targets on the three rails before your tank runs dry.
   letters, digits, spaces, `-`, `'` or `.`; other characters are ignored) and
   press Enter to save it and go back to the title. Enter on an empty box does
   nothing. When the countdown reaches 0, the score is saved with whatever you
-  typed, or with no name, which the leaderboard shows as `???`. Clicks on the
-  game do nothing while you enter a name.
+  typed, or with no name, which the leaderboard shows as `???`. Leaving the
+  game during name entry, for example through "Back to the midway", saves the
+  score the same way. Clicks on the game do nothing while you enter a name.
 - **You don't make the top 10:** the score is saved straight away with no
   name, and "Tank empty! You scored N" shows for 3 seconds before the title
   comes back. Clicks do nothing during those 3 seconds.
@@ -44,7 +45,9 @@ Each target scores 10 points for every 60 px/s of speed, rounded up:
 | Bottom | 60 px/s  | 10     |
 
 Each round saves its final score to the carnival's score board once, when the
-round ends or when its name is entered.
+round ends, when its name is entered, or when you leave during name entry.
+The screen timers count real seconds, so they last as long as they say even
+when frames are slow.
 
 ## Options
 
@@ -61,7 +64,7 @@ That board shows 1 Ada 120, 1 Bob 120, 2 Cy 90.
 
 ## Files
 
-- `game.ts`: the game logic (`createState`, `click`, `fire`, `step`,
-  `submitName`, `filterName`, `entryCountdown`, `scoreForHit`) and the
+- `game.ts`: the game logic (`createState`, `click`, `fire`, `step`, `tick`,
+  `stop`, `submitName`, `filterName`, `entryCountdown`, `scoreForHit`) and the
   `waterCannon` entry, the default export the midway finds.
 - `game.test.ts`: tests for the game logic and the screens.

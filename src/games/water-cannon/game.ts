@@ -21,6 +21,8 @@ export const ENTRY_SECONDS = 30;
 export const NAME_MAX_LENGTH = 12;
 /** The countdown turns the accent colour at this many seconds and below. */
 export const ENTRY_WARNING_SECONDS = 5;
+/** The longest physics step, so a background tab doesn't teleport everything. */
+export const MAX_STEP_SECONDS = 0.05;
 const RAILS = [
   { y: 110, speed: 180, radius: 22 },
   { y: 200, speed: -120, radius: 28 },
@@ -132,6 +134,17 @@ export function submitName(state: WaterCannonState, scores: ScoreSink = carnival
   return true;
 }
 
+/** Saves the pending score, with the name typed so far or no name. */
+function saveEntry(state: WaterCannonState, scores: ScoreSink): void {
+  scores.record(state.score, normalizeName(state.name) || undefined);
+  enter(state, 'title');
+}
+
+/** The game is closing. A round waiting for its name is saved as if the countdown ran out. */
+export function stop(state: WaterCannonState, scores: ScoreSink = carnivalScores): void {
+  if (state.phase === 'entering') saveEntry(state, scores);
+}
+
 function endRound(state: WaterCannonState, scores: ScoreSink): void {
   if (scores.makesLeaderboard(state.score)) {
     state.name = '';
@@ -142,21 +155,18 @@ function endRound(state: WaterCannonState, scores: ScoreSink): void {
   }
 }
 
-/** Moves between the screens as time passes. */
-function advancePhase(state: WaterCannonState, dt: number, scores: ScoreSink): void {
+/** Moves between the screens as `elapsed` real seconds pass. */
+function advancePhase(state: WaterCannonState, elapsed: number, scores: ScoreSink): void {
   if (state.phase === 'playing') {
     if (state.tank === 0 && state.shots.length === 0) endRound(state, scores);
     return;
   }
-  state.phaseTime += dt;
+  state.phaseTime += elapsed;
   if (state.phase === 'title' && state.phaseTime >= TITLE_SECONDS) enter(state, 'leaderboard');
   else if (state.phase === 'leaderboard' && state.phaseTime >= LEADERBOARD_SECONDS) {
     enter(state, 'title');
   } else if (state.phase === 'over' && state.phaseTime >= OVER_SECONDS) enter(state, 'title');
-  else if (state.phase === 'entering' && state.phaseTime >= ENTRY_SECONDS) {
-    scores.record(state.score, normalizeName(state.name) || undefined);
-    enter(state, 'title');
-  }
+  else if (state.phase === 'entering' && state.phaseTime >= ENTRY_SECONDS) saveEntry(state, scores);
 }
 
 /** Faster targets are worth more: 10 points per 60 px/s, rounded up. */
@@ -184,11 +194,15 @@ export function fire(state: WaterCannonState, aimX: number, aimY: number): boole
   return true;
 }
 
-/** Advances the game by `dt` seconds. */
+/**
+ * Advances the game by `dt` seconds of physics. The screen timers move by
+ * `elapsed` real seconds, which is `dt` unless the step was capped.
+ */
 export function step(
   state: WaterCannonState,
   dt: number,
   scores: ScoreSink = carnivalScores,
+  elapsed: number = dt,
 ): void {
   for (const target of state.targets) {
     target.x += target.speed * dt;
@@ -215,7 +229,17 @@ export function step(
   for (const splash of state.splashes) splash.age += dt;
   state.splashes = state.splashes.filter((s) => s.age < 0.4);
 
-  advancePhase(state, dt, scores);
+  advancePhase(state, elapsed, scores);
+}
+
+/** One animation frame, `seconds` after the last: physics is capped, screen timers are not. */
+export function tick(
+  state: WaterCannonState,
+  seconds: number,
+  scores: ScoreSink = carnivalScores,
+): void {
+  const elapsed = Math.max(0, seconds);
+  step(state, Math.min(elapsed, MAX_STEP_SECONDS), scores, elapsed);
 }
 
 function draw(
@@ -367,7 +391,6 @@ function drawLeaderboard(ctx: CanvasRenderingContext2D, rows: LeaderboardRow[]) 
 function createNameInput(): HTMLInputElement {
   const input = document.createElement('input');
   input.type = 'text';
-  input.maxLength = NAME_MAX_LENGTH;
   input.autocomplete = 'off';
   input.spellcheck = false;
   input.setAttribute('aria-label', 'Your name');
@@ -466,10 +489,8 @@ export const waterCannon: CarnivalGame = {
     let last = performance.now();
     let shownPhase = state.phase;
     const loop = (time: number) => {
-      // Cap the step so a background tab doesn't teleport everything.
-      const dt = Math.min((time - last) / 1000, 0.05);
+      tick(state, (time - last) / 1000);
       last = time;
-      step(state, dt);
       if (state.phase === 'leaderboard' && shownPhase !== 'leaderboard') {
         rows = leaderboard(waterCannon.id);
       }
@@ -485,6 +506,7 @@ export const waterCannon: CarnivalGame = {
       canvas.removeEventListener('pointermove', onMove);
       canvas.removeEventListener('pointerdown', onDown);
       removeInput();
+      stop(state);
     };
   },
 };
