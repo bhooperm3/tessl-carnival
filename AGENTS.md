@@ -66,7 +66,9 @@ src/
     midway.ts             input, camera and the animation loop
   carnival/               shared base every game uses
     registry.ts           the CarnivalGame shape and the registry
-    scores.ts             recordScore, bestScore, topScores
+    scores.ts             recordScore, bestScore, topScores, leaderboard,
+                          makesLeaderboard, normalizeName, parseSeed,
+                          applySeedFromUrl
     prizes.ts             prize tiers
     theme.ts              colours, fonts and sizes
   games/
