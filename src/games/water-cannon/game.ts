@@ -1,10 +1,28 @@
-import { canvasFont, recordScore, theme, type CarnivalGame } from '../../carnival';
+import {
+  canvasFont,
+  leaderboard,
+  makesLeaderboard,
+  normalizeName,
+  recordScore,
+  theme,
+  type CarnivalGame,
+  type LeaderboardRow,
+} from '../../carnival';
 
 const { width: WIDTH, height: HEIGHT } = theme.canvas;
 
 export const TANK_SIZE = 15;
 export const SHOT_SPEED = 700;
 export const CANNON = { x: WIDTH / 2, y: HEIGHT - 30 } as const;
+export const TITLE_SECONDS = 5;
+export const LEADERBOARD_SECONDS = 5;
+export const OVER_SECONDS = 3;
+export const ENTRY_SECONDS = 30;
+export const NAME_MAX_LENGTH = 12;
+/** The countdown turns the accent colour at this many seconds and below. */
+export const ENTRY_WARNING_SECONDS = 5;
+/** The longest physics step, so a background tab doesn't teleport everything. */
+export const MAX_STEP_SECONDS = 0.05;
 const RAILS = [
   { y: 110, speed: 180, radius: 22 },
   { y: 200, speed: -120, radius: 28 },
@@ -33,16 +51,33 @@ export interface Splash {
   age: number;
 }
 
+export type Phase = 'title' | 'leaderboard' | 'playing' | 'entering' | 'over';
+
 export interface WaterCannonState {
   targets: Target[];
   shots: Shot[];
   splashes: Splash[];
   tank: number;
   score: number;
-  phase: 'playing' | 'over';
+  phase: Phase;
+  /** Seconds spent in the current phase. */
+  phaseTime: number;
+  /** The name typed so far during `entering`. */
+  name: string;
 }
 
-export function createState(): WaterCannonState {
+/** Where a round's score goes. The game uses the carnival's scores module. */
+export interface ScoreSink {
+  makesLeaderboard(score: number): boolean;
+  record(score: number, name?: string): void;
+}
+
+const carnivalScores: ScoreSink = {
+  makesLeaderboard: (score) => makesLeaderboard('water-cannon', score),
+  record: (score, name) => void recordScore('water-cannon', score, name),
+};
+
+export function createState(phase: Phase = 'playing'): WaterCannonState {
   const spacing = WIDTH / TARGETS_PER_RAIL;
   const targets = RAILS.flatMap((rail) =>
     Array.from({ length: TARGETS_PER_RAIL }, (_, i) => ({
@@ -52,7 +87,86 @@ export function createState(): WaterCannonState {
       speed: rail.speed,
     })),
   );
-  return { targets, shots: [], splashes: [], tank: TANK_SIZE, score: 0, phase: 'playing' };
+  return {
+    targets,
+    shots: [],
+    splashes: [],
+    tank: TANK_SIZE,
+    score: 0,
+    phase,
+    phaseTime: 0,
+    name: '',
+  };
+}
+
+function enter(state: WaterCannonState, phase: Phase): void {
+  state.phase = phase;
+  state.phaseTime = 0;
+}
+
+/** A click on the canvas: starts a round from the title or leaderboard, fires while playing, else nothing. */
+export function click(state: WaterCannonState, x: number, y: number): boolean {
+  if (state.phase === 'title' || state.phase === 'leaderboard') {
+    Object.assign(state, createState('playing'));
+    return true;
+  }
+  return fire(state, x, y);
+}
+
+/** Keeps only the characters `normalizeName` allows, so nothing else appears in the box. */
+export function filterName(raw: string): string {
+  return [...raw]
+    .filter((char) => char === ' ' || normalizeName(char) !== '')
+    .join('')
+    .slice(0, NAME_MAX_LENGTH);
+}
+
+/** Whole seconds left to enter a name, from 30 down to 0. */
+export function entryCountdown(state: WaterCannonState): number {
+  return Math.max(0, Math.ceil(ENTRY_SECONDS - state.phaseTime));
+}
+
+/** Enter in the name box. Saves and returns to the title when the name has a visible character. */
+export function submitName(state: WaterCannonState, scores: ScoreSink = carnivalScores): boolean {
+  if (state.phase !== 'entering' || normalizeName(state.name) === '') return false;
+  scores.record(state.score, state.name);
+  enter(state, 'title');
+  return true;
+}
+
+/** Saves the pending score, with the name typed so far or no name. */
+function saveEntry(state: WaterCannonState, scores: ScoreSink): void {
+  scores.record(state.score, normalizeName(state.name) || undefined);
+  enter(state, 'title');
+}
+
+/** The game is closing. A round waiting for its name is saved as if the countdown ran out. */
+export function stop(state: WaterCannonState, scores: ScoreSink = carnivalScores): void {
+  if (state.phase === 'entering') saveEntry(state, scores);
+}
+
+function endRound(state: WaterCannonState, scores: ScoreSink): void {
+  if (scores.makesLeaderboard(state.score)) {
+    state.name = '';
+    enter(state, 'entering');
+  } else {
+    scores.record(state.score);
+    enter(state, 'over');
+  }
+}
+
+/** Moves between the screens as `elapsed` real seconds pass. */
+function advancePhase(state: WaterCannonState, elapsed: number, scores: ScoreSink): void {
+  if (state.phase === 'playing') {
+    if (state.tank === 0 && state.shots.length === 0) endRound(state, scores);
+    return;
+  }
+  state.phaseTime += elapsed;
+  if (state.phase === 'title' && state.phaseTime >= TITLE_SECONDS) enter(state, 'leaderboard');
+  else if (state.phase === 'leaderboard' && state.phaseTime >= LEADERBOARD_SECONDS) {
+    enter(state, 'title');
+  } else if (state.phase === 'over' && state.phaseTime >= OVER_SECONDS) enter(state, 'title');
+  else if (state.phase === 'entering' && state.phaseTime >= ENTRY_SECONDS) saveEntry(state, scores);
 }
 
 /** Faster targets are worth more: 10 points per 60 px/s, rounded up. */
@@ -80,8 +194,16 @@ export function fire(state: WaterCannonState, aimX: number, aimY: number): boole
   return true;
 }
 
-/** Advances the game by `dt` seconds. */
-export function step(state: WaterCannonState, dt: number): void {
+/**
+ * Advances the game by `dt` seconds of physics. The screen timers move by
+ * `elapsed` real seconds, which is `dt` unless the step was capped.
+ */
+export function step(
+  state: WaterCannonState,
+  dt: number,
+  scores: ScoreSink = carnivalScores,
+  elapsed: number = dt,
+): void {
   for (const target of state.targets) {
     target.x += target.speed * dt;
     if (target.x > WIDTH + target.radius) target.x = -target.radius;
@@ -107,13 +229,24 @@ export function step(state: WaterCannonState, dt: number): void {
   for (const splash of state.splashes) splash.age += dt;
   state.splashes = state.splashes.filter((s) => s.age < 0.4);
 
-  if (state.tank === 0 && state.shots.length === 0) state.phase = 'over';
+  advancePhase(state, elapsed, scores);
+}
+
+/** One animation frame, `seconds` after the last: physics is capped, screen timers are not. */
+export function tick(
+  state: WaterCannonState,
+  seconds: number,
+  scores: ScoreSink = carnivalScores,
+): void {
+  const elapsed = Math.max(0, seconds);
+  step(state, Math.min(elapsed, MAX_STEP_SECONDS), scores, elapsed);
 }
 
 function draw(
   ctx: CanvasRenderingContext2D,
   state: WaterCannonState,
   aim: { x: number; y: number },
+  rows: LeaderboardRow[],
 ) {
   const { colors } = theme;
 
@@ -185,18 +318,109 @@ function draw(
   ctx.fillText(`Water ${state.tank}/${TANK_SIZE}`, WIDTH - 16, HEIGHT - 20);
 
   if (state.phase === 'over') {
-    ctx.fillStyle = colors.background;
-    ctx.globalAlpha = 0.8;
-    ctx.fillRect(0, 0, WIDTH, HEIGHT);
-    ctx.globalAlpha = 1;
-    ctx.textAlign = 'center';
+    drawOverlay(ctx);
     ctx.fillStyle = colors.accent;
     ctx.font = canvasFont('title', 'bold');
     ctx.fillText(`Tank empty! You scored ${state.score}`, WIDTH / 2, HEIGHT / 2);
+  } else if (state.phase === 'entering') {
+    drawOverlay(ctx);
+    ctx.fillStyle = colors.accent;
+    ctx.font = canvasFont('title', 'bold');
+    ctx.fillText('New high score! Enter your name', WIDTH / 2, 150);
+    ctx.fillStyle = colors.text;
+    ctx.font = canvasFont('body', 'bold');
+    ctx.fillText(`You scored ${state.score}`, WIDTH / 2, 195);
+    const seconds = entryCountdown(state);
+    ctx.fillStyle = seconds <= ENTRY_WARNING_SECONDS ? colors.accent : colors.text;
+    ctx.font = canvasFont('title', 'bold');
+    ctx.fillText(String(seconds), WIDTH / 2, NAME_BOX.y + NAME_BOX.height + 60);
+  } else if (state.phase === 'title') {
+    drawOverlay(ctx);
+    ctx.fillStyle = colors.accent;
+    ctx.font = canvasFont('title', 'bold');
+    ctx.fillText(waterCannon.name, WIDTH / 2, HEIGHT / 2 - 10);
     ctx.fillStyle = colors.text;
     ctx.font = canvasFont('body');
-    ctx.fillText('Click to play again', WIDTH / 2, HEIGHT / 2 + 40);
+    ctx.fillText('Click to play', WIDTH / 2, HEIGHT / 2 + 30);
+  } else if (state.phase === 'leaderboard') {
+    drawOverlay(ctx);
+    drawLeaderboard(ctx, rows);
   }
+}
+
+/** Where the name box sits on the canvas during `entering`. */
+const NAME_BOX = { x: WIDTH / 2 - 140, y: 225, width: 280, height: 48 } as const;
+
+function drawOverlay(ctx: CanvasRenderingContext2D) {
+  ctx.fillStyle = theme.colors.background;
+  ctx.globalAlpha = 0.85;
+  ctx.fillRect(0, 0, WIDTH, HEIGHT);
+  ctx.globalAlpha = 1;
+  ctx.textAlign = 'center';
+}
+
+function drawLeaderboard(ctx: CanvasRenderingContext2D, rows: LeaderboardRow[]) {
+  const { colors } = theme;
+  ctx.textAlign = 'center';
+  ctx.fillStyle = colors.accent;
+  ctx.font = canvasFont('title', 'bold');
+  ctx.fillText('Top 10', WIDTH / 2, 80);
+
+  if (rows.length === 0) {
+    ctx.fillStyle = colors.text;
+    ctx.font = canvasFont('body');
+    ctx.fillText('No scores yet. Be the first!', WIDTH / 2, HEIGHT / 2);
+    return;
+  }
+
+  const left = WIDTH / 2 - 160;
+  const right = WIDTH / 2 + 160;
+  ctx.font = canvasFont('body', 'bold');
+  rows.forEach((row, i) => {
+    const y = 125 + i * 32;
+    ctx.fillStyle = i === 0 ? colors.accent : colors.text;
+    ctx.textAlign = 'left';
+    ctx.fillText(String(row.rank), left, y);
+    ctx.fillText(row.name, left + 50, y);
+    ctx.textAlign = 'right';
+    ctx.fillText(String(row.score), right, y);
+  });
+}
+
+/** The name box: a real input over the canvas, so phones bring up their keyboard. */
+function createNameInput(): HTMLInputElement {
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.autocomplete = 'off';
+  input.spellcheck = false;
+  input.setAttribute('aria-label', 'Your name');
+  Object.assign(input.style, {
+    position: 'fixed',
+    boxSizing: 'border-box',
+    margin: '0',
+    padding: '0 12px',
+    textAlign: 'center',
+    background: 'var(--color-surface)',
+    color: 'var(--color-text)',
+    border: '2px solid var(--color-accent)',
+    borderRadius: 'var(--radius)',
+    fontFamily: 'var(--font-family)',
+    fontWeight: 'bold',
+    outline: 'none',
+  });
+  return input;
+}
+
+function placeNameInput(input: HTMLInputElement, canvas: HTMLCanvasElement) {
+  const rect = canvas.getBoundingClientRect();
+  const scale = rect.width / WIDTH;
+  Object.assign(input.style, {
+    left: `${rect.left + NAME_BOX.x * scale}px`,
+    top: `${rect.top + NAME_BOX.y * scale}px`,
+    width: `${NAME_BOX.width * scale}px`,
+    height: `${NAME_BOX.height * scale}px`,
+    fontSize: `${theme.font.body * scale}px`,
+  });
 }
 
 export const waterCannon: CarnivalGame = {
@@ -210,8 +434,9 @@ export const waterCannon: CarnivalGame = {
     canvas.width = WIDTH;
     canvas.height = HEIGHT;
 
-    let state = createState();
-    let scoreRecorded = false;
+    const state = createState('title');
+    let rows: LeaderboardRow[] = [];
+    let input: HTMLInputElement | undefined;
     const aim = { x: WIDTH / 2, y: 0 };
 
     const toCanvas = (event: PointerEvent) => {
@@ -224,28 +449,54 @@ export const waterCannon: CarnivalGame = {
     const onMove = (event: PointerEvent) => Object.assign(aim, toCanvas(event));
     const onDown = (event: PointerEvent) => {
       Object.assign(aim, toCanvas(event));
-      if (state.phase === 'over') {
-        state = createState();
-        scoreRecorded = false;
-      } else {
-        fire(state, aim.x, aim.y);
-      }
+      // A click during name entry must not take the keyboard away from the box.
+      if (input) event.preventDefault();
+      click(state, aim.x, aim.y);
     };
     canvas.addEventListener('pointermove', onMove);
     canvas.addEventListener('pointerdown', onDown);
 
+    const onInput = () => {
+      if (!input) return;
+      const filtered = filterName(input.value);
+      if (filtered !== input.value) input.value = filtered;
+      state.name = filtered;
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Enter') submitName(state);
+    };
+    const removeInput = () => {
+      if (!input) return;
+      input.removeEventListener('input', onInput);
+      input.removeEventListener('keydown', onKeyDown);
+      input.remove();
+      input = undefined;
+    };
+    const syncInput = () => {
+      if (state.phase !== 'entering') return removeInput();
+      if (!input) {
+        input = createNameInput();
+        input.addEventListener('input', onInput);
+        input.addEventListener('keydown', onKeyDown);
+        document.body.append(input);
+        placeNameInput(input, canvas);
+        input.focus();
+      }
+      placeNameInput(input, canvas);
+    };
+
     let frame = 0;
     let last = performance.now();
+    let shownPhase = state.phase;
     const loop = (time: number) => {
-      // Cap the step so a background tab doesn't teleport everything.
-      const dt = Math.min((time - last) / 1000, 0.05);
+      tick(state, (time - last) / 1000);
       last = time;
-      step(state, dt);
-      if (state.phase === 'over' && !scoreRecorded) {
-        recordScore(waterCannon.id, state.score);
-        scoreRecorded = true;
+      if (state.phase === 'leaderboard' && shownPhase !== 'leaderboard') {
+        rows = leaderboard(waterCannon.id);
       }
-      draw(ctx, state, aim);
+      shownPhase = state.phase;
+      syncInput();
+      draw(ctx, state, aim, rows);
       frame = requestAnimationFrame(loop);
     };
     frame = requestAnimationFrame(loop);
@@ -254,6 +505,8 @@ export const waterCannon: CarnivalGame = {
       cancelAnimationFrame(frame);
       canvas.removeEventListener('pointermove', onMove);
       canvas.removeEventListener('pointerdown', onDown);
+      removeInput();
+      stop(state);
     };
   },
 };
