@@ -6,8 +6,29 @@ Soak the targets on the three rails before your tank runs dry.
 
 - The game opens on its title screen, which swaps with the Top 10 leaderboard
   every 5 seconds. Click either one to start a round.
-- Move the mouse to aim the cannon, and click to fire a shot of water.
-- You have 15 shots. The round ends when the tank is empty and the last shot has landed.
+- Move the mouse to aim the cannon, and click to fire a burst of water.
+- You have 15 bursts in the tank. The round ends when the tank is empty and the
+  last droplet has landed.
+
+## Aiming with the arc
+
+Water falls. Every droplet leaves the barrel at 700 px/s and gravity pulls it
+down at 400 px/s², so it flies in a curve that bends towards the ground. Aim at
+a near target and the water lands close to where you point; aim at a far one,
+such as a target at the end of the top rail, and the water drops below it. Aim
+above a far target to land on it. There is no aiming guide: the barrel shows the
+direction you fire, and judging the arc is the skill. A droplet that falls back
+below the cannon, or leaves the side of the screen, is gone. One fired higher
+than the top of the screen falls back into view.
+
+## The burst
+
+One click fires a short burst of 4 to 6 droplets, each a little off your aim,
+and uses one unit of water however many droplets it has. Each droplet stops at
+the first target it touches, so a lower target can block a burst aimed at a
+higher rail. A burst scores each target at most once, but its droplets can soak
+two or more different targets. A hit throws a splash of droplets that fall and
+fade; splash droplets are only for show and never score or move a target.
 
 ## After a round
 
@@ -64,7 +85,8 @@ That board shows 1 Ada 120, 1 Bob 120, 2 Cy 90.
 
 ## Files
 
-- `game.ts`: the game logic (`createState`, `click`, `fire`, `step`, `tick`,
+- `game.ts`: the game logic (`createState`, which takes an optional random
+  function for the spread and splashes, `click`, `fire`, `step`, `tick`,
   `stop`, `submitName`, `filterName`, `entryCountdown`, `scoreForHit`) and the
   `waterCannon` entry, the default export the midway finds.
 - `game.test.ts`: tests for the game logic and the screens.

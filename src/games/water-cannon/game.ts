@@ -13,6 +13,16 @@ const { width: WIDTH, height: HEIGHT } = theme.canvas;
 
 export const TANK_SIZE = 15;
 export const SHOT_SPEED = 700;
+/** Pulls every droplet down, in px/s². */
+export const GRAVITY = 400;
+export const BURST_MIN = 4;
+export const BURST_MAX = 6;
+/** The widest a droplet strays from the aim, either way, in radians. */
+export const BURST_SPREAD = 0.04;
+/** Seconds between droplets leaving the barrel, so a burst looks like a jet. */
+export const BURST_GAP = 0.025;
+export const SPLASH_DROPS = 6;
+export const SPLASH_SECONDS = 0.5;
 export const CANNON = { x: WIDTH / 2, y: HEIGHT - 30 } as const;
 export const TITLE_SECONDS = 5;
 export const LEADERBOARD_SECONDS = 5;
@@ -38,16 +48,28 @@ export interface Target {
   speed: number;
 }
 
+/** One click's droplets share a burst, so it scores each target at most once. */
+export interface Burst {
+  soaked: Target[];
+}
+
+/** A droplet of water in flight. */
 export interface Shot {
   x: number;
   y: number;
   vx: number;
   vy: number;
+  burst: Burst;
+  /** Seconds before it leaves the barrel. */
+  delay: number;
 }
 
+/** A splash droplet: only drawn, it never scores or touches a target. */
 export interface Splash {
   x: number;
   y: number;
+  vx: number;
+  vy: number;
   age: number;
 }
 
@@ -64,6 +86,8 @@ export interface WaterCannonState {
   phaseTime: number;
   /** The name typed so far during `entering`. */
   name: string;
+  /** Returns a number in [0, 1), like `Math.random`; the spread and splashes use it. */
+  random: () => number;
 }
 
 /** Where a round's score goes. The game uses the carnival's scores module. */
@@ -77,7 +101,10 @@ const carnivalScores: ScoreSink = {
   record: (score, name) => void recordScore('water-cannon', score, name),
 };
 
-export function createState(phase: Phase = 'playing'): WaterCannonState {
+export function createState(
+  phase: Phase = 'playing',
+  random: () => number = Math.random,
+): WaterCannonState {
   const spacing = WIDTH / TARGETS_PER_RAIL;
   const targets = RAILS.flatMap((rail) =>
     Array.from({ length: TARGETS_PER_RAIL }, (_, i) => ({
@@ -96,6 +123,7 @@ export function createState(phase: Phase = 'playing'): WaterCannonState {
     phase,
     phaseTime: 0,
     name: '',
+    random,
   };
 }
 
@@ -107,7 +135,7 @@ function enter(state: WaterCannonState, phase: Phase): void {
 /** A click on the canvas: starts a round from the title or leaderboard, fires while playing, else nothing. */
 export function click(state: WaterCannonState, x: number, y: number): boolean {
   if (state.phase === 'title' || state.phase === 'leaderboard') {
-    Object.assign(state, createState('playing'));
+    Object.assign(state, createState('playing', state.random));
     return true;
   }
   return fire(state, x, y);
@@ -178,20 +206,42 @@ export function isHit(shot: Shot, target: Target): boolean {
   return Math.hypot(shot.x - target.x, shot.y - target.y) <= target.radius;
 }
 
-/** Fires one shot of water towards the aim point. Returns false if nothing fired. */
+/**
+ * Fires one burst of 4 to 6 droplets towards the aim point, each a little off
+ * the aim. A burst uses one unit of water. Returns false if nothing fired.
+ */
 export function fire(state: WaterCannonState, aimX: number, aimY: number): boolean {
   if (state.phase !== 'playing' || state.tank === 0) return false;
-  const dx = aimX - CANNON.x;
-  const dy = Math.min(aimY - CANNON.y, -1);
-  const length = Math.hypot(dx, dy);
-  state.shots.push({
-    x: CANNON.x,
-    y: CANNON.y,
-    vx: (dx / length) * SHOT_SPEED,
-    vy: (dy / length) * SHOT_SPEED,
-  });
+  const angle = Math.atan2(Math.min(aimY - CANNON.y, -1), aimX - CANNON.x);
+  const count = Math.min(
+    BURST_MAX,
+    BURST_MIN + Math.floor(state.random() * (BURST_MAX - BURST_MIN + 1)),
+  );
+  const burst: Burst = { soaked: [] };
+  for (let i = 0; i < count; i++) {
+    // The spread never tips a droplet below the horizontal.
+    const spread = angle + (state.random() * 2 - 1) * BURST_SPREAD;
+    const a = Math.min(-0.01, Math.max(-Math.PI + 0.01, spread));
+    state.shots.push({
+      x: CANNON.x,
+      y: CANNON.y,
+      vx: Math.cos(a) * SHOT_SPEED,
+      vy: Math.sin(a) * SHOT_SPEED,
+      burst,
+      delay: i * BURST_GAP,
+    });
+  }
   state.tank -= 1;
   return true;
+}
+
+/** Throws splash droplets outwards from where a droplet hit. */
+function splash(state: WaterCannonState, x: number, y: number): void {
+  for (let i = 0; i < SPLASH_DROPS; i++) {
+    const a = -Math.PI * state.random();
+    const speed = 80 + state.random() * 120;
+    state.splashes.push({ x, y, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed, age: 0 });
+  }
 }
 
 /**
@@ -212,24 +262,43 @@ export function step(
 
   const remaining: Shot[] = [];
   for (const shot of state.shots) {
-    shot.x += shot.vx * dt;
-    shot.y += shot.vy * dt;
+    if (shot.delay > 0) {
+      shot.delay -= dt;
+      remaining.push(shot);
+      continue;
+    }
+    fall(shot, dt);
+    // A droplet stops at the first target it touches, but scores it only once per burst.
     const target = state.targets.find((t) => isHit(shot, t));
     if (target) {
-      state.score += scoreForHit(target);
-      state.splashes.push({ x: target.x, y: target.y, age: 0 });
-      // Send the soaked target back to the start of its rail.
-      target.x = target.speed > 0 ? -target.radius : WIDTH + target.radius;
-    } else if (shot.y > -10 && shot.x > -10 && shot.x < WIDTH + 10) {
+      if (!shot.burst.soaked.includes(target)) {
+        shot.burst.soaked.push(target);
+        state.score += scoreForHit(target);
+        splash(state, shot.x, shot.y);
+        // Send the soaked target back to the start of its rail.
+        target.x = target.speed > 0 ? -target.radius : WIDTH + target.radius;
+      }
+    } else if (shot.y <= CANNON.y && shot.x > -10 && shot.x < WIDTH + 10) {
+      // The sky stays open: a droplet above the top edge falls back into view.
       remaining.push(shot);
     }
   }
   state.shots = remaining;
 
-  for (const splash of state.splashes) splash.age += dt;
-  state.splashes = state.splashes.filter((s) => s.age < 0.4);
+  for (const drop of state.splashes) {
+    fall(drop, dt);
+    drop.age += dt;
+  }
+  state.splashes = state.splashes.filter((s) => s.age < SPLASH_SECONDS);
 
   advancePhase(state, elapsed, scores);
+}
+
+/** Moves a droplet `dt` seconds along its arc. */
+function fall(drop: { x: number; y: number; vx: number; vy: number }, dt: number): void {
+  drop.x += drop.vx * dt;
+  drop.y += drop.vy * dt + 0.5 * GRAVITY * dt * dt;
+  drop.vy += GRAVITY * dt;
 }
 
 /** One animation frame, `seconds` after the last: physics is capped, screen timers are not. */
@@ -280,20 +349,24 @@ function draw(
     ctx.fill();
   }
 
-  ctx.fillStyle = '#4fc3f7';
+  // Droplets, each with a short trail that tapers back along its path.
+  ctx.fillStyle = colors.water;
   for (const shot of state.shots) {
-    ctx.beginPath();
-    ctx.arc(shot.x, shot.y, 5, 0, Math.PI * 2);
-    ctx.fill();
+    if (shot.delay > 0) continue;
+    for (let i = 4; i >= 0; i--) {
+      const back = i * 0.008;
+      ctx.globalAlpha = 1 - i * 0.18;
+      ctx.beginPath();
+      ctx.arc(shot.x - shot.vx * back, shot.y - shot.vy * back, 4 - i * 0.6, 0, Math.PI * 2);
+      ctx.fill();
+    }
   }
 
-  ctx.strokeStyle = colors.water;
-  ctx.lineWidth = 3;
-  for (const splash of state.splashes) {
-    ctx.globalAlpha = 1 - splash.age / 0.4;
+  for (const drop of state.splashes) {
+    ctx.globalAlpha = 1 - drop.age / SPLASH_SECONDS;
     ctx.beginPath();
-    ctx.arc(splash.x, splash.y, 10 + splash.age * 90, 0, Math.PI * 2);
-    ctx.stroke();
+    ctx.arc(drop.x, drop.y, 3, 0, Math.PI * 2);
+    ctx.fill();
   }
   ctx.globalAlpha = 1;
 

@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
+  BURST_MAX,
+  BURST_MIN,
   CANNON,
   ENTRY_SECONDS,
+  GRAVITY,
   LEADERBOARD_SECONDS,
   MAX_STEP_SECONDS,
   OVER_SECONDS,
@@ -19,11 +22,48 @@ import {
   submitName,
   tick,
   type ScoreSink,
+  type Shot,
   type Target,
   type WaterCannonState,
 } from './game';
 
 const target: Target = { x: 400, y: 200, radius: 28, speed: 120 };
+
+/** A fixed random function: no spread, and a 5-droplet burst. */
+const middle = () => 0.5;
+
+/** A droplet with its own burst, already out of the barrel. */
+function drop(x: number, y: number, vx = 0, vy = 0): Shot {
+  return { x, y, vx, vy, burst: { soaked: [] }, delay: 0 };
+}
+
+/** Steps a playing round until its droplets have all landed, or `seconds` pass. */
+function settle(state: WaterCannonState, seconds = 5): void {
+  for (let t = 0; t < seconds && state.shots.length > 0; t += 0.01) {
+    step(state, 0.01, fakeScores(false));
+  }
+}
+
+/** Fires one burst at the aim with every target held still, lets it land, and says if it hit. */
+function fireStill(state: WaterCannonState, aimX: number, aimY: number): boolean {
+  for (const t of state.targets) t.speed = 0;
+  fire(state, aimX, aimY);
+  const burst = state.shots[0].burst;
+  settle(state);
+  return burst.soaked.length > 0;
+}
+
+/** The aim, above a point, whose arc passes through it. */
+function aimFor(x: number, y: number): { x: number; y: number } {
+  const dx = x - CANNON.x;
+  const dy = CANNON.y - y;
+  // Solve for the launch angle that reaches (dx, dy): take the flatter one.
+  const v2 = 700 * 700;
+  const root = Math.sqrt(v2 * v2 - GRAVITY * (GRAVITY * dx * dx + 2 * dy * v2));
+  const angle = Math.atan2(v2 - root, GRAVITY * Math.abs(dx));
+  const side = Math.sign(dx) || 1;
+  return { x: CANNON.x + side * Math.cos(angle) * 100, y: CANNON.y - Math.sin(angle) * 100 };
+}
 
 describe('water cannon', () => {
   it('starts with a full tank and no score', () => {
@@ -37,7 +77,7 @@ describe('water cannon', () => {
     const state = createState();
     expect(fire(state, 400, 0)).toBe(true);
     expect(state.tank).toBe(TANK_SIZE - 1);
-    expect(state.shots).toHaveLength(1);
+    expect(state.shots.length).toBeGreaterThanOrEqual(BURST_MIN);
   });
 
   it('cannot fire once the tank is empty', () => {
@@ -56,7 +96,7 @@ describe('water cannon', () => {
   it('scores a hit and sends the target back to the start of its rail', () => {
     const state = createState();
     state.targets = [{ ...target }];
-    state.shots = [{ x: target.x, y: target.y + 5, vx: 0, vy: 0 }];
+    state.shots = [drop(target.x, target.y + 5)];
     step(state, 0);
     expect(state.score).toBe(scoreForHit(target));
     expect(state.shots).toHaveLength(0);
@@ -66,7 +106,7 @@ describe('water cannon', () => {
   it('ends the round when the tank is empty and the last shot has landed', () => {
     const state = createState();
     state.tank = 0;
-    state.shots = [{ x: 10, y: -20, vx: 0, vy: -700 }];
+    state.shots = [drop(10, CANNON.y - 1, 0, 700)];
     step(state, 0.1, fakeScores(false));
     expect(state.phase).toBe('over');
   });
@@ -75,20 +115,163 @@ describe('water cannon', () => {
     const state = createState();
     state.targets = [];
     state.tank = 0;
-    state.shots = [{ x: 400, y: 300, vx: 0, vy: -700 }];
+    state.shots = [drop(400, 300, 0, -700)];
     step(state, 0.1, fakeScores(true));
     expect(state.phase).toBe('playing');
   });
 
   it('detects a hit inside the target and a miss outside it', () => {
-    expect(isHit({ x: 410, y: 210, vx: 0, vy: 0 }, target)).toBe(true);
-    expect(isHit({ x: 460, y: 200, vx: 0, vy: 0 }, target)).toBe(false);
+    expect(isHit(drop(410, 210), target)).toBe(true);
+    expect(isHit(drop(460, 200), target)).toBe(false);
   });
 
   it('scores a fast target higher than a slow one', () => {
     const slow = scoreForHit({ ...target, speed: 60 });
     const fast = scoreForHit({ ...target, speed: -180 });
     expect(Math.max(fast, slow)).toBeGreaterThanOrEqual(slow);
+  });
+});
+
+describe('water cannon droplets', () => {
+  it('rises, slows, then falls when fired straight up', () => {
+    const state = createState('playing', middle);
+    state.targets = [];
+    fire(state, CANNON.x, 0);
+    const shot = state.shots[0];
+    const speeds: number[] = [];
+    for (let i = 0; i < 200; i++) {
+      step(state, 0.01, fakeScores(false));
+      speeds.push(shot.vy);
+    }
+    expect(speeds[0]).toBeLessThan(0);
+    expect(speeds.at(-1)).toBeGreaterThan(0);
+    for (let i = 1; i < speeds.length; i++) expect(speeds[i]).toBeGreaterThan(speeds[i - 1]);
+  });
+
+  it('removes droplets that leave the side of the screen', () => {
+    const state = createState('playing', middle);
+    state.targets = [];
+    state.shots = [drop(795, 300, 400, 0)];
+    step(state, 0.1, fakeScores(false));
+    expect(state.shots).toHaveLength(0);
+  });
+
+  it('removes droplets that fall back below the cannon', () => {
+    const state = createState('playing', middle);
+    state.targets = [];
+    fire(state, CANNON.x, 0);
+    settle(state, 10);
+    expect(state.shots).toHaveLength(0);
+  });
+
+  it('can hit a target at either end of every rail', () => {
+    for (const y of [110, 200, 290]) {
+      for (const x of [0, 800]) {
+        const state = createState('playing', middle);
+        const t = state.targets.find((t) => t.y === y)!;
+        state.targets = [{ ...t, x }];
+        const aim = aimFor(x, y);
+        expect(fireStill(state, aim.x, aim.y), `rail ${y}, x ${x}`).toBe(true);
+      }
+    }
+  });
+
+  it('falls short of a top rail target aimed at directly, and reaches it aimed higher', () => {
+    const top = { x: 700, y: 110, radius: 22, speed: 180 };
+    const direct = createState('playing', middle);
+    direct.targets = [{ ...top }];
+    expect(fireStill(direct, top.x, top.y)).toBe(false);
+
+    const higher = createState('playing', middle);
+    higher.targets = [{ ...top }];
+    const aim = aimFor(top.x, top.y);
+    expect(aim.y).toBeLessThan(
+      CANNON.y - ((CANNON.y - top.y) / (top.x - CANNON.x)) * (aim.x - CANNON.x),
+    );
+    expect(fireStill(higher, aim.x, aim.y)).toBe(true);
+  });
+
+  it('uses one unit of water per click, however many droplets the burst has', () => {
+    for (const r of [0, 0.5, 0.999]) {
+      const state = createState('playing', () => r);
+      click(state, 400, 0);
+      expect(state.tank).toBe(TANK_SIZE - 1);
+      expect(state.shots.length).toBeGreaterThanOrEqual(BURST_MIN);
+      expect(state.shots.length).toBeLessThanOrEqual(BURST_MAX);
+    }
+  });
+
+  it('scores a target at most once per burst', () => {
+    const state = createState('playing', middle);
+    const t = { x: 400, y: 200, radius: 28, speed: 0 };
+    state.targets = [t];
+    fire(state, 400, 200);
+    const burst = state.shots[0].burst;
+    // Every droplet lands in the target at once, and it stays where it is.
+    state.shots = state.shots.map((s) => ({ ...s, x: 400, y: 200, delay: 0 }));
+    step(state, 0, fakeScores(false));
+    t.x = 400;
+    state.shots = [{ ...drop(400, 200), burst }];
+    step(state, 0, fakeScores(false));
+    expect(state.score).toBe(0);
+    expect(state.shots).toHaveLength(0);
+  });
+
+  it('can score two different targets with one burst', () => {
+    const state = createState('playing', middle);
+    const a = { x: 300, y: 200, radius: 28, speed: 120 };
+    const b = { x: 500, y: 290, radius: 34, speed: 60 };
+    state.targets = [a, b];
+    fire(state, 400, 0);
+    const [first, second] = state.shots;
+    state.shots = [
+      { ...first, x: a.x, y: a.y, delay: 0 },
+      { ...second, x: b.x, y: b.y, delay: 0 },
+    ];
+    step(state, 0, fakeScores(false));
+    expect(state.score).toBe(20 + 10);
+  });
+
+  it('stops a droplet at the first target it touches', () => {
+    const state = createState('playing', middle);
+    state.targets = [{ ...target }];
+    state.shots = [drop(target.x, target.y)];
+    step(state, 0, fakeScores(false));
+    expect(state.shots).toHaveLength(0);
+  });
+
+  it('throws splash droplets that never score or move a target', () => {
+    const state = createState('playing', middle);
+    state.targets = [{ ...target, speed: 0 }];
+    state.shots = [drop(target.x, target.y)];
+    step(state, 0, fakeScores(false));
+    expect(state.splashes.length).toBeGreaterThan(0);
+    const score = state.score;
+    // Put the target back under its own splash.
+    const t = state.targets[0];
+    t.x = target.x;
+    for (let i = 0; i < 60; i++) step(state, 0.01, fakeScores(false));
+    expect(state.score).toBe(score);
+    expect(t.x).toBe(target.x);
+  });
+
+  it('lets splash droplets fall and fade away', () => {
+    const state = createState('playing', middle);
+    state.targets = [{ ...target, speed: 0 }];
+    state.shots = [drop(target.x, target.y)];
+    step(state, 0, fakeScores(false));
+    const splash = state.splashes[0];
+    const vy = splash.vy;
+    step(state, 0.1, fakeScores(false));
+    expect(splash.vy).toBeGreaterThan(vy);
+    step(state, 1, fakeScores(false));
+    expect(state.splashes).toHaveLength(0);
+  });
+
+  it('keeps its random function when a new round starts', () => {
+    const state = createState('title', middle);
+    click(state, 400, 0);
+    expect(state.random).toBe(middle);
   });
 });
 
